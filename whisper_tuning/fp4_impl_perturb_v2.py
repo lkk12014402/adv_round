@@ -79,8 +79,7 @@ class BlockSharedRounding(nn.Module):
         beta: float = 10.0,
         range_scale: float = 0.5,
         mode: str = "soft-ste",
-        enable_perturbation: bool = True,
-        num_blocks: int=0
+        enable_perturbation: bool = True
     ):
         super().__init__()
         self.block_size = block_size
@@ -90,8 +89,6 @@ class BlockSharedRounding(nn.Module):
         self.enable_perturbation = enable_perturbation
 
         self.delta_raw = None  # 动态按输入块数分配
-
-        self._allocate(num_blocks, "cuda")
 
     def _allocate(self, num_blocks: int, device):
         if not self.enable_perturbation:
@@ -402,103 +399,95 @@ def analyze_rounding_diff(
         "pseudo_float": pseudo
     }
 
-# ========= 示例运行 =========
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    x = torch.randn(64, 128)  # (64,128) 最后一维可被 32 整除
-    # 初始化并训练几步 δ
-    pseudo, _, _, rounding_mod, _ = quantize_mxfp4_perturb(
-        x, block_size=32, enable_perturbation=True,
-        mode="soft-ste", beta=8.0
+# 构造“边界附近”数据
+def synth_weights(num_rows=128, num_cols=256, block_size=32, noise_range=0.2):
+    midpoints = torch.tensor([0.25,0.75,1.25,1.75,2.5,3.5,5.0])
+    # 随机选中点
+    choice = torch.randint(0, len(midpoints), (num_rows, num_cols))
+    mids = midpoints[choice]
+    noise = (torch.rand_like(mids) - 0.5) * (2*noise_range)
+    base = mids + noise
+    # 随机符号
+    signs = torch.where(torch.rand_like(base) > 0.5, 1.0, -1.0)
+    W = (base * signs).clamp(-5.5, 5.5)  # 避免超过最大中点太多
+    # 再加少量远离边界的值模拟真实分布
+    mask_far = torch.rand_like(W) < 0.1
+    W[mask_far] = W[mask_far] * 2.0
+    return W
+
+def ordinal_to_values(ord_tensor: torch.Tensor):
+    return E2M1_VALUES.to(ord_tensor.device)[ord_tensor]
+
+def analyze_change(ord_before, ord_after):
+    diff = ord_after - ord_before
+    up = (diff>0).sum().item()
+    down = (diff<0).sum().item()
+    same = (diff==0).sum().item()
+    total = diff.numel()
+    return {
+        "up": up, "down": down, "same": same,
+        "up_pct": up*100/total, "down_pct": down*100/total, "same_pct": same*100/total
+    }
+
+def main():
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    W = synth_weights().to(device)
+
+    # 基线（无扰动、最近值）
+    pseudo_base, ord_base, mod = quantize_mxfp4_perturb(
+        W, block_size=32, enable_perturbation=False, mode="hard", return_pseudo=True
     )
-    if rounding_mod.delta_raw is not None:
-        opt = torch.optim.Adam([rounding_mod.delta_raw], lr=1e-3)
-        for step in range(50):
-            pseudo, _, _, _, _ = quantize_mxfp4_perturb(
-                x, block_size=32, rounding_module=rounding_mod,
-                enable_perturbation=True, mode="soft-ste", beta=8.0
-            )
-            loss = (pseudo - x).pow(2).mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            if step % 10 == 0:
-                print(f"Train step {step} loss={loss.item():.6f}")
+    base_mse = (pseudo_base - W).pow(2).mean().item()
+    print(f"[Baseline] MSE={base_mse:.6f}")
 
-    stats = analyze_rounding_diff(
-        x, block_size=32, rounding_module=rounding_mod,
-        beta=8.0, range_scale=0.5, mode="soft-ste",
-        enable_perturbation=True
-    )
-
-    print("\n=== Global Direction Stats ===")
-    print(f"Total={stats['total']}  Up={stats['upward']} ({stats['upward_pct']:.2f}%) "
-          f"Down={stats['downward']} ({stats['downward_pct']:.2f}%) "
-          f"Unchanged={stats['unchanged']} ({stats['unchanged_pct']:.2f}%)")
-    print("\n=== By Magnitude (Baseline Ordinal) ===")
-    for k, row in stats["by_magnitude"].items():
-        print(f"Ord {k}: count={row['count']} up={row['up']}({row['up_pct']:.1f}%) "
-              f"down={row['down']}({row['down_pct']:.1f}%) unchanged={row['unchanged']}({row['unchanged_pct']:.1f}%)")
-    if stats["delta_raw_stats"] is not None:
-        print("\nDelta stats:", stats["delta_raw_stats"])
-    print("\n=== First 5 Blocks ===")
-    for row in stats["by_block"][:5]:
-        print(row)
-
-
-
-
-
-
-
-
-# ================== 使用示例（训练扰动） ==================
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    x = torch.randn(64, 128)  # 128 可被 32 整除
-
-    # 原始量化（不带扰动）
-    q_codes, q_scales = quantize_mxfp4(x)
-    deq = dequantize_mxfp4(q_codes, q_scales, block_size=32, dtype=x.dtype)
-    base_err = (deq - x).pow(2).mean().item()
-    print(f"[Base] MSE={base_err:.6f}")
-
-    # 带扰动的量化（软STE）
-    pseudo, codes, scales, rounding_mod, ord_hard = quantize_mxfp4_perturb(
-        x, block_size=32, enable_perturbation=True, mode="soft-ste", beta=8.0
-    )
-    init_err = (pseudo - x).pow(2).mean().item()
-    print(f"[Perturb Init] pseudo MSE={init_err:.6f}")
-
-    # 训练扰动参数（仅优化 rounding_mod.delta_raw）
-    if rounding_mod.delta_raw is not None:
-        optimizer = torch.optim.Adam([rounding_mod.delta_raw], lr=3e-4)
-        for step in range(1, 201):
-            pseudo, _, _, _, _ = quantize_mxfp4_perturb(
-                x, block_size=32, rounding_module=rounding_mod,
-                enable_perturbation=True, mode="soft-ste", beta=8.0
-            )
-            loss = (pseudo - x).pow(2).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            if step % 50 == 0 or step == 1:
-                avg_delta = rounding_mod.constrained_delta().mean().item()
-                print(f"[Train step {step}] loss={loss.item():.6f} avg_delta={avg_delta:.4f}")
-
-        final_pseudo, _, _, _, _ = quantize_mxfp4_perturb(
-            x, block_size=32, rounding_module=rounding_mod,
-            enable_perturbation=True, mode="soft-ste", beta=8.0
+    # 预热阶段：soft (梯度稳定、beta 小)
+    epochs_soft = 150
+    optimizer = torch.optim.Adam([mod.delta_raw], lr=5e-3)
+    for step in range(1, epochs_soft+1):
+        pseudo, ord_soft, _ = quantize_mxfp4_perturb(
+            W, block_size=32, rounding_module=mod,
+            enable_perturbation=True, mode="soft",
+            beta=4.0, range_scale=0.5, return_pseudo=True
         )
-        final_err = (final_pseudo - x).pow(2).mean().item()
-        print(f"[Perturb Final] pseudo MSE={final_err:.6f}")
+        loss = (pseudo - W).pow(2).mean() + 1e-4 * (mod.delta().pow(2).mean())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if step % 30 == 0 or step == 1:
+            mse_now = (pseudo - W).pow(2).mean().item()
+            print(f"[Soft {step}] MSE={mse_now:.6f} delta_mean={mod.delta().mean().item():.4f}")
 
-    # 关闭扰动回退到原始逻辑
-    pseudo_off, codes_off, scales_off, _, _ = quantize_mxfp4_perturb(
-        x, block_size=32, rounding_module=rounding_mod,
-        enable_perturbation=False, mode="hard"
+    # 切换到 soft-ste（硬前向语义 + 软梯度），升高 beta
+    epochs_ste = 150
+    for step in range(1, epochs_ste+1):
+        pseudo, ord_ste, _ = quantize_mxfp4_perturb(
+            W, block_size=32, rounding_module=mod,
+            enable_perturbation=True, mode="soft-ste",
+            beta=7.0, range_scale=0.5, return_pseudo=True
+        )
+        loss = (pseudo - W).pow(2).mean() + 1e-4 * (mod.delta().pow(2).mean())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if step % 30 == 0 or step == 1:
+            mse_now = (pseudo - W).pow(2).mean().item()
+            print(f"[STE {step}] MSE={mse_now:.6f} delta_mean={mod.delta().mean().item():.4f}")
+
+    # 最终统计
+    final_pseudo, final_ord, _ = quantize_mxfp4_perturb(
+        W, block_size=32, rounding_module=mod,
+        enable_perturbation=True, mode="hard",
+        beta=7.0, range_scale=0.5, return_pseudo=True
     )
-    # pseudo_off 为硬值复原（因为 soft-ste/hard 时 pseudo 是硬映射），验证与原始一致性
-    deq_off = dequantize_mxfp4(codes_off, scales_off, block_size=32, dtype=x.dtype)
-    off_err = (deq_off - x).pow(2).mean().item()
-    print(f"[Disable Perturb] MSE={off_err:.6f}")
+    final_mse = (final_pseudo - W).pow(2).mean().item()
+    change_stats = analyze_change(ord_base, final_ord)
+    print(f"\n[Final] Baseline MSE={base_mse:.6f}  Final MSE={final_mse:.6f}  Δ={base_mse-final_mse:.6f}")
+    print("Ordinal change:", change_stats)
+    print("Delta stats: mean={:.4f} std={:.4f} min={:.4f} max={:.4f}".format(
+        mod.delta().mean().item(), mod.delta().std().item(),
+        mod.delta().min().item(), mod.delta().max().item()
+    ))
+
+if __name__ == "__main__":
+    main()
